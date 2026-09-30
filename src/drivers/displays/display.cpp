@@ -147,8 +147,15 @@ void switchToNextScreen()
 }
 
 // Draw the current cyclic screen
+#ifdef CYD_SCREEN_SLEEP_SECONDS
+bool cydScreenAsleep();
+#endif
+
 void drawCurrentScreen(unsigned long mElapsed)
 {
+#ifdef CYD_SCREEN_SLEEP_SECONDS
+  if (cydScreenAsleep()) return;
+#endif
 #if defined(ESP32_2432S028_2USB)
   if (statsMemoryWindow.load(std::memory_order_acquire)) return;
   // Nonblocking: never queue UI frames behind a network operation.

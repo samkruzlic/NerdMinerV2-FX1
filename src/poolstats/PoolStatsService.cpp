@@ -12,6 +12,10 @@
 #include "../drivers/displays/display.h"
 #include "../crypto/ShaResourcePolicy.h"
 
+#ifdef CYD_SCREEN_SLEEP_SECONDS
+bool cydScreenAsleep();
+#endif
+
 namespace {
 
 constexpr uint32_t WIFI_RECHECK_MS = 5UL * 1000UL;
@@ -138,6 +142,12 @@ void poolStatsTask(void *) {
         publishSnapshot(current);
       }
       nextAttemptMs = now + WIFI_RECHECK_MS;
+#ifdef CYD_SCREEN_SLEEP_SECONDS
+    } else if (cydScreenAsleep()) {
+      // Nobody can see the panel: skip TLS refreshes, keeping the deadline
+      // current so the first loop after a wake fetches straight away.
+      nextAttemptMs = now;
+#endif
     } else if (timeReached(now, nextAttemptMs)) {
       const PoolClockAction clockAction = poolStatsClockAction(
           needsTlsClock(), static_cast<int64_t>(time(nullptr)), timeSyncStarted);
