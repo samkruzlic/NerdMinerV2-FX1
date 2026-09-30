@@ -87,6 +87,9 @@ void setup()
 #ifdef HW_SHA256_TEST
   while (1) HwShaTest();
 #endif
+#if defined(CONFIG_IDF_TARGET_ESP32) && defined(HARDWARE_SHA265)
+  classicShaSelfTest();
+#endif
 
   // Setup the buttons
   #if defined(PIN_BUTTON_1) && !defined(PIN_BUTTON_2) //One button device
