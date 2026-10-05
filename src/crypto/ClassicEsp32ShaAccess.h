@@ -87,6 +87,40 @@ static inline __attribute__((always_inline)) uint32_t waitIdleAndReadFinalWord()
 #endif
 }
 
+// Timed-kernel access: only inside a DPORT_STALL_OTHER_CPU_START/END interval
+// with interrupts masked. Plain s32i/l32i through asm volatile: no MEMW (the
+// compiler emits one before every volatile C access), and asm volatile keeps
+// program order between them. Measured on the classic ESP32: SHA_TEXT stores
+// followed by the command store without MEMW are seen in order.
+template <uint32_t kOffset>
+static inline __attribute__((always_inline)) void rawStore(uint32_t *base, uint32_t value)
+{
+    __asm__ __volatile__("s32i %0, %1, %2"
+                         :: "a" (value), "a" (base), "i" (kOffset) : "memory");
+}
+
+template <uint32_t kOffset>
+static inline __attribute__((always_inline)) uint32_t rawLoad(uint32_t *base)
+{
+    uint32_t value;
+    __asm__ __volatile__("l32i %0, %1, %2"
+                         : "=a" (value) : "a" (base), "i" (kOffset) : "memory");
+    return value;
+}
+
+static inline __attribute__((always_inline)) uint32_t cycleCount()
+{
+    uint32_t cycles;
+    __asm__ __volatile__("rsr %0, ccount" : "=a" (cycles));
+    return cycles;
+}
+
+// Spin until at least `cycles` CPU cycles have passed since `since`.
+static inline __attribute__((always_inline)) void waitCyclesSince(uint32_t since, uint32_t cycles)
+{
+    while (cycleCount() - since < cycles) {}
+}
+
 static inline __attribute__((always_inline)) uint32_t byteSwap(uint32_t value)
 {
     // Avoid the Xtensa libgcc __bswapsi2 call for every nonce. These are

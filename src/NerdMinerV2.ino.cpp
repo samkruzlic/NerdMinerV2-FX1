@@ -79,13 +79,21 @@ void setup()
   // Idle task that would reset WDT never runs, because core 0 gets fully utilized
   disableCore0WDT();
 #ifdef NERDMINER_SHA_DIAGNOSTICS
+#ifdef W390_KERNEL_SOAK
+  classicShaSelfTest();
+  runW390KernelSoak();
+#else
   runClassicShaDiagnostics();
+#endif
   for (;;) delay(1000);
 #endif
   //disableCore1WDT();
 
 #ifdef HW_SHA256_TEST
   while (1) HwShaTest();
+#endif
+#if defined(CONFIG_IDF_TARGET_ESP32) && defined(HARDWARE_SHA265)
+  classicShaSelfTest();
 #endif
 
   // Setup the buttons

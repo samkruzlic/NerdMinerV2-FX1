@@ -13,3 +13,9 @@ implementation, exact target comparison, candidate validation, generation and
 range behavior, and fixed-seed differential comparison with the optimized
 software mining SHA. Its block-header vectors cover genesis and heights 1,
 100000, and 700000.
+
+It also covers the classic ESP32 timed-kernel policy
+(`src/crypto/ClassicKernelPolicy.h`): chip/clock gating, the one-in-4,096
+runtime sample, known-answer verdicts and the one-way fallback to the polled
+kernel. The kernel's emitted code is checked by
+`tools/validate_classic_sha_codegen.py` (both kernels).

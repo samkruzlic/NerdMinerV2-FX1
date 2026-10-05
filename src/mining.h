@@ -26,6 +26,12 @@ void minerWorkerHw(void * task_id);
 #ifdef NERDMINER_SHA_DIAGNOSTICS
 void runClassicShaDiagnostics();
 #endif
+#ifdef W390_KERNEL_SOAK
+void runW390KernelSoak();
+#endif
+#if defined(CONFIG_IDF_TARGET_ESP32) && defined(HARDWARE_SHA265)
+void classicShaSelfTest();
+#endif
 
 String printLocalTime(void);
 

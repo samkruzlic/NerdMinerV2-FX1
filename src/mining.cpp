@@ -3,6 +3,7 @@
 #include <WiFi.h>
 #include <esp_task_wdt.h>
 #include <esp_timer.h>
+#include <esp_chip_info.h>
 #include <nvs_flash.h>
 #include <nvs.h>
 //#include "ShaTests/nerdSHA256.h"
@@ -23,6 +24,7 @@
 #include "crypto/ReferenceSha256.h"
 #include "crypto/MiningRangePolicy.h"
 #include "crypto/ShaResourcePolicy.h"
+#include "crypto/ClassicKernelPolicy.h"
 
 //10 Jobs per second
 #define NONCE_PER_JOB_SW 4096
@@ -177,6 +179,7 @@ struct JobResult
   uint8_t raw_header[80];
   bool has_candidate = false;
   double required_difficulty = 0;
+  bool timed_kernel = false;  // classic ESP32: the candidate came from the timed kernel
 };
 
 static std::mutex s_job_mutex;
@@ -302,6 +305,10 @@ static void MiningJobStop(uint32_t &job_pool, std::map<uint32_t, std::shared_ptr
   job_pool = 0xFFFFFFFF;
   submition_map.clear();
 }
+
+#if defined(HARDWARE_SHA265) && defined(CONFIG_IDF_TARGET_ESP32)
+static void classicCandidateRejected(const JobResult *result);
+#endif
 
 #ifdef RANDOM_NONCE
 uint64_t s_random_state = 1;
@@ -701,6 +708,9 @@ void runStratumWorker(void *name) {
           Serial.print(" reference=");
           for (unsigned i=0; i<32; ++i) Serial.printf("%02x", reference[i]);
           Serial.println();
+#if defined(HARDWARE_SHA265) && defined(CONFIG_IDF_TARGET_ESP32)
+          classicCandidateRejected(res.get());
+#endif
           Serial.print("SHA diagnostic header=");
           for (unsigned i=0; i<80; ++i) Serial.printf("%02x%s", res->raw_header[i], (i&3U)==3U ? " " : "");
           Serial.println();
@@ -1240,6 +1250,28 @@ static inline __attribute__((always_inline)) void nerd_sha_ll_fill_text_block_sh
     reg_addr_buf[15] = 0x00000100;
 }
 
+// Set by classicShaSelfTest() when the two-store block-3 padding fails a known
+// answer on this chip; the kernel then writes all of words 8..15.
+volatile uint32_t s_classic_full_padding = 0;
+
+// Timed kernel ("kernel A") or today's polled kernel, with the runtime net's
+// counters. Selected by classicShaSelfTest(); switches to polled for good on
+// any known-answer or sample mismatch.
+classic_kernel::FallbackState s_classic_kernel;
+// Locked groups started, for the runtime net's rotating sample offset.
+uint32_t s_classic_sample_group = 0;
+static_assert(classic_kernel::kGroupNonces == 1024, "sample schedule assumes 1,024-nonce groups");
+
+// Runtime net (c): a candidate that fails the pre-submit reference re-check
+// and came from the timed kernel proves that kernel wrong. The range was
+// already handed on, so only the kernel is switched (one-way, one line).
+static void __attribute__((noinline)) classicCandidateRejected(const JobResult *result)
+{
+  if (s_classic_kernel.invalidCandidate(result->timed_kernel))
+    Serial.printf("CRITICAL: [SHA] timed kernel produced an invalid candidate nonce=%08x; "
+                  "using the polled kernel until reboot\n", result->nonce);
+}
+
 namespace {
 
 // SHA_TEXT is shared across all three classic ESP32 engines. Reserve them
@@ -1320,113 +1352,377 @@ static bool s_diag_force_digest = true;
 static uint32_t s_diag_checked = 0;
 static uint32_t s_diag_errors = 0;
 static uint32_t s_diag_hits = 0;
-static bool diagCheckNonce(const JobRequest *job, uint32_t nonce,
-                           const uint8_t hash[32], uint32_t final_word,
-                           bool passes_filter);
+static void diagRecordNonce(uint32_t nonce, const uint8_t hash[32],
+                            uint32_t final_word, bool passes_filter);
+static bool diagFlushBurst(const JobRequest *job);
+#endif
+#ifdef W390_KERNEL_SOAK
+// Development-only: the W390 kernel soak forces the kernel per call (0 polled,
+// 1 timed, -1 the runtime selection); it never touches s_classic_kernel.
+static int32_t s_soak_kernel = -1;
+static inline bool soakKernelForced() { return s_soak_kernel >= 0; }
+#else
+static inline bool soakKernelForced() { return false; }
 #endif
 
 static constexpr uint32_t CLASSIC_SHA_GROUP_NONCES = 1024;
 
+// Runtime net of the timed kernel: re-hash one sampled nonce in software and
+// compare its final word. Called only after the group's stall and shared-memory
+// lock are released. On a mismatch the timed kernel stays off until reboot.
+static bool __attribute__((noinline))
+checkTimedSample(const JobRequest *job, uint32_t nonce, uint32_t final_word)
+{
+  const uint32_t reference = classic_kernel::referenceFinalWord(job->raw_header, nonce);
+  if (s_classic_kernel.recordSample(reference == final_word))
+    return true;
+  if (!soakKernelForced())  // the soak reports its own mismatches
+    Serial.printf("CRITICAL: [SHA] timed kernel sample mismatch nonce=%08x kernel=%08x reference=%08x; "
+                "using the polled kernel until reboot\n", nonce, final_word, reference);
+  return false;
+}
+
+// Each group of up to CLASSIC_SHA_GROUP_NONCES nonces runs with SHA_TEXT locked
+// and the other CPU stalled. The job generation is written only by the stratum
+// task, which is pinned to the other CPU, so it cannot change while the stall
+// holds: it is checked once per group, after the stall starts, instead of every
+// 256 nonces. The inner loop carries no bookkeeping beyond the early filter.
+//
+// Two kernels share this group frame; the choice is read once per group:
+//  - polled (today's): every input written while the engine is idle, BUSY
+//    polled after a MEMW for every block.
+//  - timed ("kernel A", eligible 240 MHz rev-3 chips that pass the boot
+//    known-answer test): fixed cycle waits from ccount instead of BUSY, and the
+//    next block's words written while the engine is busy, at the points the
+//    bench measured as latched (classic_kernel::k*WaitCycles).
 static void IRAM_ATTR __attribute__((noinline, optimize("O2")))
 runClassicHardwareSequential(const JobRequest *job,
                                          JobResult *result,
                                          uint8_t sha_buffer[128],
                                          uint8_t hash[32])
 {
-  result->nonce_count = job->nonce_count;
+  const uint32_t first = job->nonce_start;
+  const uint32_t count = job->nonce_count;
   uint32_t *const words = nerd_sha_text_words();
-  bool memory_locked = false;
-  int64_t groupBegan = 0;
-  for (uint32_t offset = 0; offset < job->nonce_count; ++offset)
+  const bool full_padding = s_classic_full_padding != 0;
+  uint32_t done = 0;
+  result->nonce_count = count;
+  while (done < count)
   {
-    const uint32_t nonce = job->nonce_start + offset;
-    // SHA_TEXT is shared by SHA-1/256/384/512, not only SHA-256 users.
-    // Amortize the shared-memory critical section over a bounded group. Other SHA
-    // algorithms cannot start while this critical section is held. Wait for all engines
-    // on acquisition; subsequent nonces already end with SHA-256 confirmed idle.
-    // Local interrupts are masked by the SDK lock: never yield or perform
-    // network, queue or reference-validation work while holding this lock.
-    if (!memory_locked) {
-      groupBegan = esp_timer_get_time();
-      esp_sha_lock_memory_block();
-      sha_hal_wait_idle();
-      DPORT_STALL_OTHER_CPU_START();
-      memory_locked = true;
-    }
-    nerd_sha_ll_fill_text_block_sha256(sha_buffer, words);
-    nerd_sha_control_write(words, SHA_256_START_REG);
-
-    // This CPU-only conversion is safe to overlap with the first compression;
-    // SHA_TEXT is not touched until the engine is confirmed idle.
-    const uint32_t nonce_be = classic_sha::byteSwap(nonce);
-
-    classic_sha::waitIdleOtherCpuStalled();
-    nerd_sha_ll_fill_text_block_sha256_upper(sha_buffer + 64, nonce_be, words);
-    nerd_sha_control_write(words, SHA_256_CONTINUE_REG);
-
-    classic_sha::waitIdleOtherCpuStalled();
-    nerd_sha_control_write(words, SHA_256_LOAD_REG);
-    classic_sha::waitIdleOtherCpuStalled();
-    nerd_sha_ll_fill_text_block_sha256_double(words);
-    nerd_sha_control_write(words, SHA_256_START_REG);
-
-    classic_sha::waitIdleOtherCpuStalled();
-    nerd_sha_control_write(words, SHA_256_LOAD_REG);
-    classic_sha::waitIdleOtherCpuStalled();
-    const uint32_t final_word = _DPORT_REG_READ(SHA_TEXT_BASE + 7 * sizeof(uint32_t));
-    const bool passes_filter = nerd_sha_ll_read_digest_swap_from_word(hash,
-#ifdef NERDMINER_SHA_DIAGNOSTICS
-      s_diag_force_digest,
+    const uint32_t group = count - done < CLASSIC_SHA_GROUP_NONCES ?
+                           count - done : CLASSIC_SHA_GROUP_NONCES;
+    uint32_t nonce = first + done;
+    const uint32_t group_end = nonce + group;  // modulo 2^32, compared with !=
+    bool passes_filter = false;
+#ifdef W390_KERNEL_SOAK
+    const bool timed = soakKernelForced() ? s_soak_kernel == 1 :
+                       s_classic_kernel.activeWord().load(std::memory_order_acquire) ==
+                       static_cast<uint32_t>(classic_kernel::Kernel::Timed);
 #else
-      false,
+    const bool timed = s_classic_kernel.activeWord().load(std::memory_order_acquire) ==
+                       static_cast<uint32_t>(classic_kernel::Kernel::Timed);
 #endif
-      final_word);
-    if (passes_filter || ((offset + 1U) & (CLASSIC_SHA_GROUP_NONCES - 1U)) == 0 || offset + 1U == job->nonce_count) {
+    bool sampled = false;
+    uint32_t sample_nonce = 0, sample_word = 0;
+    // Runtime net (a): one group in 4 is sampled, at a rotating offset; a
+    // target beyond the group's last nonce means no sample in this group.
+    const uint32_t sample_target =
+        nonce + classic_kernel::sampleOffset(s_classic_sample_group++);
+
+    // SHA_TEXT is shared by SHA-1/256/384/512, not only SHA-256 users. Other
+    // SHA algorithms cannot start while this critical section is held. Local
+    // interrupts are masked by the SDK lock: never yield or perform network,
+    // queue or reference-validation work while holding it.
+    const int64_t groupBegan = esp_timer_get_time();
+    esp_sha_lock_memory_block();
+    sha_hal_wait_idle();
+    DPORT_STALL_OTHER_CPU_START();
+    if (s_working_generation.load(std::memory_order_acquire) != job->generation) {
       DPORT_STALL_OTHER_CPU_END();
       esp_sha_unlock_memory_block();
-      memory_locked = false;
-      if (secureTransportCpuActive()) {
-        // Idle peripheral, no shared-memory lock and no interrupt masking:
-        // lend a bounded CPU window to TLS without a slow software nonce range.
-        // TLS computation needs a bounded share of the other CPU. Record I/O
-        // without this window failed a physical watchdog test. No SHA/DPORT
-        // lock is held here and these cycles are never counted as hashes.
-        const uint32_t windowUs = static_cast<uint32_t>(
-            (esp_timer_get_time() - groupBegan) / 2);
-        const uint32_t maximumUs = 1500U;
-        const bool handshake = secureTransportHandshakeActive();
-        const int64_t windowBegan = esp_timer_get_time();
-        delayMicroseconds(windowUs < maximumUs ? windowUs : maximumUs);
-        const uint32_t measuredWindowUs = static_cast<uint32_t>(esp_timer_get_time() - windowBegan);
-        shaCpuWindowMicroseconds().fetch_add(measuredWindowUs, std::memory_order_relaxed);
-        if (handshake) shaHandshakeWindowMicroseconds().fetch_add(measuredWindowUs, std::memory_order_relaxed);
-      }
+      result->nonce_count = done;
+      return;
     }
-#ifdef NERDMINER_SHA_DIAGNOSTICS
-    if (!diagCheckNonce(job, nonce, hash, final_word, passes_filter)) {
-      result->nonce_count = offset + 1;
-      break;
-    }
-#endif
-    if (passes_filter) {
-      recordHardwareCandidate(result, job, nonce, hash);
-      if (result->has_candidate) {
-        result->nonce_count = offset + 1;
-        break;
-      }
-    }
-
-    if ((offset & 0xFFU) == 0 &&
-        s_working_generation.load(std::memory_order_acquire) != job->generation)
+    if (timed)
     {
-      result->nonce_count = offset + 1;
-      break;
+      using classic_kernel::kCommandWaitCycles;
+      using classic_kernel::kLoadWaitCycles;
+      using classic_kernel::kPaddingWaitCycles;
+      using classic_kernel::kLatchWaitCycles;
+      using classic_sha::rawStore;
+      using classic_sha::waitCyclesSince;
+      constexpr uint32_t START = SHA_256_START_REG - SHA_TEXT_BASE;
+      constexpr uint32_t CONTINUE = SHA_256_CONTINUE_REG - SHA_TEXT_BASE;
+      constexpr uint32_t LOAD = SHA_256_LOAD_REG - SHA_TEXT_BASE;
+      const uint32_t *const block1 = reinterpret_cast<const uint32_t *>(sha_buffer);
+      const uint32_t *const block2 = reinterpret_cast<const uint32_t *>(sha_buffer + 64);
+      const uint32_t t0 = block2[0], t1 = block2[1], t2 = block2[2];
+
+      // Block-1 words 8..15 of each nonce are written during the previous
+      // nonce's block-3 compression; the first nonce of a group needs them now.
+      rawStore<32>(words, block1[8]);  rawStore<36>(words, block1[9]);
+      rawStore<40>(words, block1[10]); rawStore<44>(words, block1[11]);
+      rawStore<48>(words, block1[12]); rawStore<52>(words, block1[13]);
+      rawStore<56>(words, block1[14]); rawStore<60>(words, block1[15]);
+      uint32_t final_word = 0;
+      do
+      {
+        rawStore<0>(words, block1[0]);   rawStore<4>(words, block1[1]);
+        rawStore<8>(words, block1[2]);   rawStore<12>(words, block1[3]);
+        rawStore<16>(words, block1[4]);  rawStore<20>(words, block1[5]);
+        rawStore<24>(words, block1[6]);  rawStore<28>(words, block1[7]);
+        rawStore<START>(words, 1);
+        uint32_t t = classic_sha::cycleCount();
+
+        // Block 2 goes in once block 1 is latched (kLatchWaitCycles).
+        const uint32_t nonce_be = classic_sha::byteSwap(nonce);
+#ifdef W390_SOAK_BREAK_LATCH
+        // DELIBERATELY BROKEN soak build: no latch wait at all (the 531806c bug).
+#else
+        waitCyclesSince(t, kLatchWaitCycles);
+#endif
+        rawStore<0>(words, t0);          rawStore<4>(words, t1);
+        rawStore<8>(words, t2);          rawStore<12>(words, nonce_be);
+        rawStore<16>(words, 0x80000000); rawStore<20>(words, 0);
+        rawStore<24>(words, 0);          rawStore<28>(words, 0);
+        rawStore<32>(words, 0);          rawStore<36>(words, 0);
+        rawStore<40>(words, 0);          rawStore<44>(words, 0);
+        rawStore<48>(words, 0);          rawStore<52>(words, 0);
+        rawStore<56>(words, 0);          rawStore<60>(words, 0x00000280);
+        // Free while block 1 compresses: keep the previous nonce's final word
+        // if it is the runtime net's sample (the last nonce is checked below).
+        if (nonce - 1U == sample_target) {
+          sampled = true;
+          sample_nonce = nonce - 1U;
+          sample_word = final_word;
+        }
+        waitCyclesSince(t, kCommandWaitCycles);
+        rawStore<CONTINUE>(words, 1);
+        t = classic_sha::cycleCount();
+
+        // Block-3 padding while block 2 compresses. LOAD replaces words 0..7
+        // only; words 9..14 are still the zeros of block 2 (see the polled
+        // kernel), unless the boot test selected the full padding.
+        waitCyclesSince(t, kPaddingWaitCycles);
+        rawStore<32>(words, 0x80000000);
+        if (full_padding) {
+          rawStore<36>(words, 0); rawStore<40>(words, 0); rawStore<44>(words, 0);
+          rawStore<48>(words, 0); rawStore<52>(words, 0); rawStore<56>(words, 0);
+        }
+        rawStore<60>(words, 0x00000100);
+        waitCyclesSince(t, kCommandWaitCycles);
+        rawStore<LOAD>(words, 1);
+        t = classic_sha::cycleCount();
+        waitCyclesSince(t, kLoadWaitCycles);
+        rawStore<START>(words, 1);
+        t = classic_sha::cycleCount();
+
+        // The next nonce's block-1 words 8..15 go in once block 3 is latched.
+#ifdef W390_SOAK_BREAK_LATCH
+        // DELIBERATELY BROKEN soak build: no latch wait at all (the 531806c bug).
+#else
+        waitCyclesSince(t, kLatchWaitCycles);
+#endif
+        rawStore<32>(words, block1[8]);  rawStore<36>(words, block1[9]);
+        rawStore<40>(words, block1[10]); rawStore<44>(words, block1[11]);
+        rawStore<48>(words, block1[12]); rawStore<52>(words, block1[13]);
+        rawStore<56>(words, block1[14]); rawStore<60>(words, block1[15]);
+        waitCyclesSince(t, kCommandWaitCycles);
+        rawStore<LOAD>(words, 1);
+        t = classic_sha::cycleCount();
+        waitCyclesSince(t, kLoadWaitCycles);
+        final_word = classic_sha::rawLoad<28>(words);
+        passes_filter = nerd_sha_ll_read_digest_swap_from_word(hash,
+#ifdef NERDMINER_SHA_DIAGNOSTICS
+          s_diag_force_digest,
+#else
+          false,
+#endif
+          final_word);
+#ifdef NERDMINER_SHA_DIAGNOSTICS
+        diagRecordNonce(nonce, hash, final_word, passes_filter);
+#endif
+        ++nonce;
+      } while (!passes_filter && nonce != group_end);
+      if (nonce - 1U == sample_target) {
+        sampled = true;
+        sample_nonce = nonce - 1U;
+        sample_word = final_word;
+      }
     }
-  }
-  if (memory_locked) {
+    else
+    {
+    do
+    {
+      nerd_sha_ll_fill_text_block_sha256(sha_buffer, words);
+      nerd_sha_control_write(words, SHA_256_START_REG);
+
+      // This CPU-only conversion is safe to overlap with the first compression;
+      // SHA_TEXT is not touched until the engine is confirmed idle.
+      const uint32_t nonce_be = classic_sha::byteSwap(nonce);
+
+      classic_sha::waitIdleOtherCpuStalled();
+      nerd_sha_ll_fill_text_block_sha256_upper(sha_buffer + 64, nonce_be, words);
+      nerd_sha_control_write(words, SHA_256_CONTINUE_REG);
+
+      classic_sha::waitIdleOtherCpuStalled();
+      nerd_sha_control_write(words, SHA_256_LOAD_REG);
+      classic_sha::waitIdleOtherCpuStalled();
+      // LOAD replaces words 0..7 only; words 9..14 are still the zeros of the
+      // second block (measured on the classic ESP32 engine, not documented), so
+      // the 32-byte message padding needs just words 8 and 15. The boot-time
+      // known-answer test selects the full padding if a chip disagrees.
+      if (full_padding) {
+        nerd_sha_ll_fill_text_block_sha256_double(words);
+      } else {
+        words[8]  = 0x80000000;
+        words[15] = 0x00000100;
+      }
+      nerd_sha_control_write(words, SHA_256_START_REG);
+
+      classic_sha::waitIdleOtherCpuStalled();
+      nerd_sha_control_write(words, SHA_256_LOAD_REG);
+      classic_sha::waitIdleOtherCpuStalled();
+      const uint32_t final_word = _DPORT_REG_READ(SHA_TEXT_BASE + 7 * sizeof(uint32_t));
+      passes_filter = nerd_sha_ll_read_digest_swap_from_word(hash,
+#ifdef NERDMINER_SHA_DIAGNOSTICS
+        s_diag_force_digest,
+#else
+        false,
+#endif
+        final_word);
+#ifdef NERDMINER_SHA_DIAGNOSTICS
+      diagRecordNonce(nonce, hash, final_word, passes_filter);
+#endif
+      ++nonce;
+    } while (!passes_filter && nonce != group_end);
+    }
     DPORT_STALL_OTHER_CPU_END();
     esp_sha_unlock_memory_block();
+    const uint32_t group_began_done = done;
+    done = nonce - first;
+
+    if (secureTransportCpuActive()) {
+      // Idle peripheral, no shared-memory lock and no interrupt masking:
+      // lend a bounded CPU window to TLS without a slow software nonce range.
+      // TLS computation needs a bounded share of the other CPU. Record I/O
+      // without this window failed a physical watchdog test. No SHA/DPORT
+      // lock is held here and these cycles are never counted as hashes.
+      const uint32_t windowUs = static_cast<uint32_t>(
+          (esp_timer_get_time() - groupBegan) / 2);
+      const uint32_t maximumUs = 1500U;
+      const bool handshake = secureTransportHandshakeActive();
+      const int64_t windowBegan = esp_timer_get_time();
+      delayMicroseconds(windowUs < maximumUs ? windowUs : maximumUs);
+      const uint32_t measuredWindowUs = static_cast<uint32_t>(esp_timer_get_time() - windowBegan);
+      shaCpuWindowMicroseconds().fetch_add(measuredWindowUs, std::memory_order_relaxed);
+      if (handshake) shaHandshakeWindowMicroseconds().fetch_add(measuredWindowUs, std::memory_order_relaxed);
+    }
+#if defined(NERDMINER_SHA_DIAGNOSTICS) && !defined(W390_KERNEL_SOAK)
+    if (!diagFlushBurst(job)) {
+      result->nonce_count = done;
+      return;
+    }
+#endif
+    // Outside the stall and lock. A mismatch makes every result of this group
+    // suspect: hash the same group again with the polled kernel (unless the
+    // soak forces the kernel; it compares the group itself).
+    if (sampled && !checkTimedSample(job, sample_nonce, sample_word) && !soakKernelForced()) {
+      done = group_began_done;
+      continue;
+    }
+    if (passes_filter) {
+      recordHardwareCandidate(result, job, nonce - 1U, hash);
+      if (result->has_candidate) {
+        result->nonce_count = done;
+        result->timed_kernel = timed;
+        return;
+      }
+    }
   }
+}
+
+// Known-answer test of the production kernel on public Bitcoin block headers.
+// Each range starts three nonces before the block's own nonce (none of those
+// passes the 16-bit filter), so the kernel must stop exactly on the real nonce
+// with the reference SHA-256d.
+static const char *const kClassicKnownHeaders[] = {
+  "0100000000000000000000000000000000000000000000000000000000000000000000003ba3edfd"
+  "7a7b12b27ac72c3e67768f617fc81bc3888a51323a9fb8aa4b1e5e4a29ab5f49ffff001d1dac2b7c",
+  "010000006fe28c0ab6f1b372c1a6a246ae63f74f931e8365e15a089c68d6190000000000982051fd"
+  "1e4ba744bbbe680e1fee14677ba1a3c3540bf7b1cdb606e857233e0e61bc6649ffff001d01e36299",
+  "0100000050120119172a610421a6c3011dd330d9df07b63616c2cc1f1cd00200000000006657a925"
+  "2aacd5c0b2940996ecff952228c3067cc38d4885efb5a4ac4247e9f337221b4d4c86041b0f2b5710"};
+static constexpr unsigned kClassicKnownHeaderCount =
+    sizeof(kClassicKnownHeaders) / sizeof(kClassicKnownHeaders[0]);
+
+struct ClassicKnownAnswerRun {
+  classic_kernel::KnownAnswer outcome;
+  uint32_t nonce;           // the block's own nonce
+  bool kernel_hit;          // the kernel stopped on a filter hit
+  uint32_t kernel_word;     // its final word (H7), when it did
+  uint32_t reference_word;  // the reference H7 for the block's own nonce
+  uint32_t hit_nonce;       // where the kernel stopped, when it hit
+  uint32_t completed;       // nonces it reported done
+};
+
+static ClassicKnownAnswerRun __attribute__((noinline)) classicKnownAnswer(const char *hex)
+{
+  JobRequest job{};
+  job.generation = s_working_generation.load(std::memory_order_acquire);
+  job.difficulty = 0.0;  // every filter hit is a candidate
+  for (unsigned i = 0; i < 80; ++i) {
+    const char pair[3] = {hex[i * 2], hex[i * 2 + 1], 0};
+    job.raw_header[i] = static_cast<uint8_t>(strtoul(pair, nullptr, 16));
+  }
+  alignas(4) uint8_t buffer[128] = {};
+  uint8_t hash[32], reference[32];
+  memcpy(buffer, job.raw_header, 80);
+  buffer[80] = 0x80; buffer[126] = 0x02; buffer[127] = 0x80;
+  for (unsigned i = 0; i < 32; ++i)
+    reinterpret_cast<uint32_t *>(buffer)[i] = __builtin_bswap32(reinterpret_cast<uint32_t *>(buffer)[i]);
+  uint32_t known;
+  memcpy(&known, job.raw_header + 76, sizeof(known));
+  job.nonce_start = known - classic_kernel::kKnownAnswerLead;
+  job.nonce_count = 8;
+  JobResult result{};
+  runClassicHardwareSequential(&job, &result, buffer, hash);
+  mining_validation::referenceSha256d(job.raw_header, 80, reference);
+  ClassicKnownAnswerRun run{};
+  run.nonce = known;
+  run.kernel_hit = result.has_candidate;
+  run.kernel_word = __builtin_bswap32(reinterpret_cast<const uint32_t *>(result.hash)[7]);
+  run.reference_word = __builtin_bswap32(reinterpret_cast<const uint32_t *>(reference)[7]);
+  run.hit_nonce = result.nonce;
+  run.completed = result.nonce_count;
+  run.outcome = classic_kernel::classifyKnownAnswer(
+      result.has_candidate, result.nonce, result.nonce_count, known,
+      memcmp(result.hash, reference, sizeof(reference)) == 0,
+      s_working_generation.load(std::memory_order_acquire) != job.generation);
+  return run;
+}
+
+static bool classicKnownAnswers()
+{
+  for (const char *hex : kClassicKnownHeaders)
+    if (classicKnownAnswer(hex).outcome != classic_kernel::KnownAnswer::Pass)
+      return false;
+  return true;
+}
+
+// Runtime net (b): once per new job, one public header through the timed
+// kernel, with the shared engines already reserved by the caller.
+// The decision (due, cancelled, failed) is classic_kernel::FallbackState::checkJob.
+static void __attribute__((noinline)) classicTimedJobCheck(uint32_t generation)
+{
+  s_classic_kernel.checkJob(generation, kClassicKnownHeaderCount, [](unsigned header) {
+    const ClassicKnownAnswerRun run = classicKnownAnswer(kClassicKnownHeaders[header]);
+    if (run.outcome == classic_kernel::KnownAnswer::Fail)
+      Serial.printf("CRITICAL: [SHA] timed kernel known-answer mismatch nonce=%08x kernel=%s%08x reference=%08x; "
+                    "using the polled kernel until reboot\n", run.nonce,
+                    run.kernel_hit ? "" : "no-hit/", run.kernel_word, run.reference_word);
+    return run.outcome;
+  });
 }
 
 #if NERDMINER_EXPERIMENTAL_SHA_TEXT_OVERLAP
@@ -1504,6 +1800,9 @@ runClassicHardwarePipelined(const JobRequest *job,
 #ifdef NERDMINER_SHA_DIAGNOSTICS
 #include "crypto/ClassicShaDiagnostics.h"
 #endif
+#ifdef W390_KERNEL_SOAK
+#include "crypto/W390KernelSoak.h"
+#endif
 
 // TLS may own the SHA-256 engine across network waits. Never wait on that
 // engine: complete a bounded prefix with the proven software engine. The
@@ -1544,6 +1843,44 @@ static void runSoftwareFallback(const JobRequest *job, JobResult *result)
   shaFallbackNonces().fetch_add(result->nonce_count, std::memory_order_relaxed);
 }
 
+void classicShaSelfTest()
+{
+  if (!tryReserveClassicSha()) {
+    s_classic_full_padding = 1;
+    Serial.println("[SHA] classic self-test skipped (engine busy); using full padding, polled kernel");
+    return;
+  }
+  // The padding choice is made on the polled kernel; the timed kernel then
+  // has to pass the same known answers with it before it is used.
+  bool ok = classicKnownAnswers();
+  if (!ok) {
+    s_classic_full_padding = 1;
+    ok = classicKnownAnswers();
+    Serial.printf("CRITICAL: [SHA] two-store padding failed known answers; full padding %s\n",
+                  ok ? "passes, using it" : "ALSO FAILS");
+  } else {
+    Serial.println("[SHA] classic self-test passed (3 known blocks, two-store padding)");
+  }
+  esp_chip_info_t chip;
+  esp_chip_info(&chip);
+  const uint32_t cpuMhz = getCpuFrequencyMhz();
+  if (!classic_kernel::timedKernelEligible(cpuMhz, chip.revision)) {
+    Serial.printf("[SHA] timed kernel not eligible (cpu=%u MHz, chip rev %u); polled kernel\n",
+                  cpuMhz, chip.revision);
+  } else if (s_classic_kernel.enableIfKnownAnswersPass(true, kClassicKnownHeaderCount, [](unsigned header) {
+               const ClassicKnownAnswerRun run = classicKnownAnswer(kClassicKnownHeaders[header]);
+               if (run.outcome != classic_kernel::KnownAnswer::Pass)
+                 Serial.printf("[SHA] timed known answer failed: block nonce=%08x hit=%d at %08x completed=%u kernel H7=%08x reference H7=%08x\n",
+                               run.nonce, run.kernel_hit, run.hit_nonce, run.completed, run.kernel_word, run.reference_word);
+               return run.outcome;
+             })) {
+    Serial.println("[SHA] timed kernel passed 3 known blocks; using it");
+  } else {
+    Serial.println("CRITICAL: [SHA] timed kernel failed known answers; polled kernel until reboot");
+  }
+  releaseClassicSha();
+}
+
 void minerWorkerHw(void * task_id)
 {
   unsigned int miner_id = (uint32_t)task_id;
@@ -1580,6 +1917,7 @@ void minerWorkerHw(void * task_id)
       } else if (secureTransportActive() || !tryReserveClassicSha()) {
         runSoftwareFallback(job.get(), result.get());
       } else {
+      classicTimedJobCheck(job->generation);  // once per new job, while timed
 #if NERDMINER_EXPERIMENTAL_SHA_TEXT_OVERLAP
       if (s_hardware_pipeline_enabled.load(std::memory_order_acquire))
       {
@@ -1734,9 +2072,17 @@ void runMonitor(void *name)
       elapsedKHs = static_cast<uint32_t>(currentKHashes - totalKHashes);
       totalKHashes = currentKHashes;
       // Allocation-free telemetry is independent of rendering and UI smoothing.
+#if defined(HARDWARE_SHA265) && defined(CONFIG_IDF_TARGET_ESP32)
+      Serial.printf("[Work] t=%u completed=%llu generation=%u kernel=%s samples=%u mismatches=%u\n",
+        now_millis, static_cast<unsigned long long>(currentHashes),
+        s_working_generation.load(std::memory_order_acquire),
+        classic_kernel::kernelName(s_classic_kernel.active()),
+        s_classic_kernel.samples(), s_classic_kernel.mismatches());
+#else
       Serial.printf("[Work] t=%u completed=%llu generation=%u\n", now_millis,
         static_cast<unsigned long long>(currentHashes),
         s_working_generation.load(std::memory_order_acquire));
+#endif
 
       uptime_frac += mElapsed;
       while (uptime_frac >= 1000)
