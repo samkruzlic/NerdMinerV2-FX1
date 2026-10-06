@@ -13,6 +13,48 @@ extern void releaseCydScreenScratch();
 extern bool restoreCydScreenScratch();
 #endif
 
+#ifdef BUTTON_SCREEN_SLEEP_SECONDS
+#include <atomic>
+#include <TFT_eSPI.h>  // this board's TFT_BL / TFT_BACKLIGHT_ON
+// Screen sleep: after BUTTON_SCREEN_SLEEP_SECONDS without a button event the
+// backlight goes off and no frame is rendered, which gives the miner back the
+// time drawing takes. The next button event only wakes the screen.
+// The atomics are read by the monitor task and written by the loop task
+// (buttons); everything else here belongs to the loop task alone.
+namespace {
+std::atomic<bool> screenAsleep{false};
+std::atomic<bool> miningScreensStarted{false};
+uint32_t lastButtonMillis = 0;  // millis() is 32 bits on the ESP32
+bool sleepTimerStarted = false;
+void sleepScreen() {
+  screenAsleep.store(true);
+  digitalWrite(TFT_BL, !TFT_BACKLIGHT_ON);
+  Serial.println("[Screen] sleep");
+}
+}
+
+bool screenSleepButtonEvent() {
+  lastButtonMillis = millis();
+  if (!screenAsleep.load()) return false;
+  digitalWrite(TFT_BL, TFT_BACKLIGHT_ON);
+  screenAsleep.store(false);
+  Serial.println("[Screen] wake");
+  return true;
+}
+
+void screenSleepTick() {
+  if (!sleepTimerStarted) {
+    // Start counting when mining screens start, never during a setup portal.
+    if (!miningScreensStarted.load()) return;
+    sleepTimerStarted = true;
+    lastButtonMillis = millis();
+  }
+  if (!screenAsleep.load() &&
+      uint32_t(millis()) - lastButtonMillis >= BUTTON_SCREEN_SLEEP_SECONDS * 1000UL)
+    sleepScreen();
+}
+#endif
+
 #ifdef NO_DISPLAY
 DisplayDriver *currentDisplayDriver = &noDisplayDriver;
 #endif
@@ -113,6 +155,11 @@ void endStatsDisplayMemoryWindow() {
 // Alternate screen state
 void alternateScreenState()
 {
+#ifdef BUTTON_SCREEN_SLEEP_SECONDS
+  // "Screen off" is an immediate sleep, so it stops drawing too.
+  if (screenAsleep.load()) screenSleepButtonEvent(); else sleepScreen();
+  return;
+#endif
   currentDisplayDriver->alternateScreenState();
 }
 
@@ -149,6 +196,10 @@ void switchToNextScreen()
 // Draw the current cyclic screen
 void drawCurrentScreen(unsigned long mElapsed)
 {
+#ifdef BUTTON_SCREEN_SLEEP_SECONDS
+  miningScreensStarted.store(true);
+  if (screenAsleep.load()) return;
+#endif
 #if defined(ESP32_2432S028_2USB)
   if (statsMemoryWindow.load(std::memory_order_acquire)) return;
   // Nonblocking: never queue UI frames behind a network operation.
@@ -176,6 +227,9 @@ void drawCurrentScreen(unsigned long mElapsed)
 // Animate the current cyclic screen
 void animateCurrentScreen(unsigned long frame)
 {
+#ifdef BUTTON_SCREEN_SLEEP_SECONDS
+  if (screenAsleep.load()) return;
+#endif
   currentDisplayDriver->animateCurrentScreen(frame);
 }
 

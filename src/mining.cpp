@@ -23,6 +23,8 @@
 #include "crypto/ReferenceSha256.h"
 #include "crypto/MiningRangePolicy.h"
 #include "crypto/ShaResourcePolicy.h"
+#include "crypto/BatchedSha.h"
+#include "crypto/BatchedShaSelfTest.h"
 
 //10 Jobs per second
 #define NONCE_PER_JOB_SW 4096
@@ -942,45 +944,18 @@ static inline void nerd_sha_hal_wait_idle()
 }
 
 //#define VALIDATION
-void minerWorkerHw(void * task_id)
+// FX1's original S2/S3/C3 loop, unchanged apart from moving it out of
+// minerWorkerHw. On the S3 and C3 it is the last fallback of the batched kernel.
+static void runSha2EngineOriginalRange(const JobRequest *job, JobResult *result)
 {
-  unsigned int miner_id = (uint32_t)task_id;
-  Serial.printf("[MINER] %d Started minerWorkerHw Task!\n", miner_id);
-
-  std::shared_ptr<JobRequest> job;
-  std::shared_ptr<JobResult> result;
-  uint8_t interResult[64];
   uint8_t hash[32];
   uint8_t digest_mid[32];
   uint8_t sha_buffer[64];
-  uint32_t wdt_counter = 0;
-
 #ifdef VALIDATION
   uint8_t doubleHash[32];
   uint32_t diget_mid[8];
   uint32_t bake[17];
 #endif
-
-  while (1)
-  {
-    finishWorkerRange(s_job_request_list_hw, job, result);
-    {
-      std::lock_guard<std::mutex> lock(s_job_mutex);
-      if (!s_job_request_list_hw.empty())
-      {
-        job = s_job_request_list_hw.front();
-        s_job_request_list_hw.pop_front();
-      } else
-        job.reset();
-    }
-    if (job)
-    {
-      result = std::make_shared<JobResult>();
-      result->generation = job->generation;
-      result->nonce = 0xFFFFFFFF;
-      result->nonce_count = job->nonce_count;
-      result->difficulty = job->difficulty;
-      result->required_difficulty = job->difficulty;
       memcpy(digest_mid, job->midstate, sizeof(digest_mid));
       memcpy(sha_buffer, job->sha_buffer+64, sizeof(sha_buffer));
 #ifdef VALIDATION
@@ -988,7 +963,6 @@ void minerWorkerHw(void * task_id)
       nerd_sha256_bake(diget_mid, job->sha_buffer+64, bake);
 #endif
 
-      esp_sha_acquire_hardware();
       REG_WRITE(SHA_MODE_REG, SHA2_256);
       for (uint32_t offset = 0; offset < job->nonce_count; ++offset)
       {
@@ -1012,8 +986,10 @@ void minerWorkerHw(void * task_id)
           //Serial.printf("Hw 16bit Share, nonce=0x%X\n", n);
 #ifdef VALIDATION
           //Validation
-          ((uint32_t*)(job->sha_buffer+64+12))[0] = n;
-          nerd_sha256d_baked(diget_mid, job->sha_buffer+64, bake, doubleHash);
+          uint8_t header_tail[64];
+          memcpy(header_tail, job->sha_buffer+64, sizeof(header_tail));
+          ((uint32_t*)(header_tail+12))[0] = n;
+          nerd_sha256d_baked(diget_mid, header_tail, bake, doubleHash);
           for (int i = 0; i < 32; ++i)
           {
             if (hash[i] != doubleHash[i])
@@ -1046,6 +1022,293 @@ void minerWorkerHw(void * task_id)
           break;
         }
       }
+}
+
+#if defined(CONFIG_IDF_TARGET_ESP32S3) || defined(CONFIG_IDF_TARGET_ESP32C3)
+#define NERDMINER_BATCHED_SHA 1
+// ---------------------------------------------------------------------------
+// ESP32-S3 / ESP32-C3: batched SHA-256d (src/crypto/BatchedSha.h).
+//
+// Relies on SHA behaviour measured on both chips (nerdminer s3bench/c3bench, W390):
+// SHA_H is writable and is the state CONTINUE resumes from; SHA_TEXT and SHA_H
+// are latched when START/CONTINUE is written, so SHA_TEXT may be rewritten while
+// BUSY; the engine never modifies SHA_TEXT; SHA_H reads 0 while BUSY. A peripheral
+// access costs ~13-15 CPU cycles on the S3 (~6-9 on the C3) against ~64-100 for a
+// block, so the kernel minimises accesses and keeps SHA_TEXT writes off the
+// critical path. A boot known-answer test through this production code selects
+// G32 -> F32 -> the original loop.
+//
+// Test coverage: the host tests (tools/run_batched_sha_tests.sh) do NOT compile the
+// BSHA_* macros or BatchedShaEngine below. They run BatchedSha.h against a hand-written
+// model of the peripheral, so a fault in this register code passes the whole host
+// suite; for example dropping the volatile/"memory" from the accesses, or reading
+// SHA_H[0..6] before the BUSY wait. Such faults are caught only on the chip: by the
+// boot known-answer test, and by the *_SHA_DIAG builds. A boot-test failure is not
+// an error the user sees: the board falls back to a slower kernel (F32 or the
+// original loop) until reboot and logs it once on serial ("[SHA] ... FAIL"). A fault
+// the boot test misses (e.g. one that hits one nonce in a thousand) loses hashes;
+// a wrong candidate hash is still rejected by runMiner's reference SHA-256d check
+// before submission.
+#ifndef NERDMINER_BATCHED_SHA_FORCE_KERNEL
+#define NERDMINER_BATCHED_SHA_FORCE_KERNEL 0  // 0: self-test picks; 1: start at F32; 2: original loop
+#endif
+
+static_assert(SHA_START_REG - DR_REG_SHA_BASE == 0x10 && SHA_CONTINUE_REG - DR_REG_SHA_BASE == 0x14 &&
+              SHA_BUSY_REG - DR_REG_SHA_BASE == 0x18 && SHA_H_BASE - DR_REG_SHA_BASE == 0x40 &&
+              SHA_TEXT_BASE - DR_REG_SHA_BASE == 0x80, "ESP32-S3/C3 SHA register map");
+
+#if defined(CONFIG_IDF_TARGET_ESP32S3)
+// Xtensa: plain stores and loads (no MEMW per access); MEMW only around START/CONTINUE.
+#define BSHA_ST(off, v) __asm__ __volatile__("s32i %0, %1, %2" :: "r"((uint32_t)(v)), "r"(base), "i"(off) : "memory")
+#define BSHA_LD(off) ({ uint32_t _w; __asm__ __volatile__("l32i %0, %1, %2" : "=r"(_w) : "r"(base), "i"(off) : "memory"); _w; })
+#define BSHA_MEMW() __asm__ __volatile__("memw" ::: "memory")
+#else
+// RISC-V (C3): plain volatile accesses, as IDF's own C3 SHA HAL uses; in-order core,
+// a BUSY read right after a command never missed it (0/1000 on silicon).
+#define BSHA_ST(off, v) (((volatile uint32_t *)DR_REG_SHA_BASE)[(off) / 4] = (uint32_t)(v))
+#define BSHA_LD(off) (((volatile uint32_t *)DR_REG_SHA_BASE)[(off) / 4])
+#define BSHA_MEMW() __asm__ __volatile__("" ::: "memory")
+#endif
+#define BSHA_H(k) (0x40 + 4 * (k))
+#define BSHA_T(k) (0x80 + 4 * (k))
+
+template <bool kPollWord7, int kBroken>  // kBroken: development-only faults, 0 in every release build
+struct BatchedShaEngine {
+  static constexpr uint32_t base = DR_REG_SHA_BASE;
+  static inline __attribute__((always_inline)) void command(uint32_t off) {
+    BSHA_MEMW();
+    if (off == 0x10) BSHA_ST(0x10, 1); else BSHA_ST(0x14, 1);
+    BSHA_MEMW();  // later loads must not pass the command
+  }
+  static inline __attribute__((always_inline)) uint32_t waitWord7() {
+    uint32_t w = 0;
+    if (kPollWord7) {  // SHA_H reads 0 while BUSY; a genuine 0 falls through to BUSY
+      for (int k = 8; k; --k) { w = BSHA_LD(BSHA_H(7)); if (w) return w; }
+    }
+    while (BSHA_LD(0x18)) {}
+    return BSHA_LD(BSHA_H(7));
+  }
+  static inline __attribute__((always_inline)) void begin() {
+    REG_WRITE(SHA_MODE_REG, SHA2_256);
+    BSHA_ST(BSHA_T(9), 0); BSHA_ST(BSHA_T(10), 0); BSHA_ST(BSHA_T(11), 0);
+    BSHA_ST(BSHA_T(12), 0); BSHA_ST(BSHA_T(13), 0); BSHA_ST(BSHA_T(14), 0);
+  }
+  static inline __attribute__((always_inline)) void loadBlock2(const uint32_t t[3], uint32_t nonce) {
+    BSHA_ST(BSHA_T(0), t[0]); BSHA_ST(BSHA_T(1), t[1]); BSHA_ST(BSHA_T(2), t[2]);
+    BSHA_ST(BSHA_T(3), nonce); BSHA_ST(BSHA_T(4), 0x80); BSHA_ST(BSHA_T(5), 0);
+    BSHA_ST(BSHA_T(6), 0); BSHA_ST(BSHA_T(7), 0); BSHA_ST(BSHA_T(8), 0);
+    BSHA_ST(BSHA_T(15), 0x80020000);
+  }
+  static inline __attribute__((always_inline)) void setNonce(uint32_t nonce) {
+    if (kBroken == 2 && (nonce & 1023U) == 517U) return;  // stale nonce, rare: the boot test cannot see it
+    BSHA_ST(BSHA_T(3), nonce);
+  }
+  static inline __attribute__((always_inline)) void setState(const uint32_t m[8]) {
+    BSHA_ST(BSHA_H(0), m[0]); BSHA_ST(BSHA_H(1), m[1]); BSHA_ST(BSHA_H(2), m[2]);
+    if (kBroken != 1) BSHA_ST(BSHA_H(3), m[3]);
+    BSHA_ST(BSHA_H(4), m[4]); BSHA_ST(BSHA_H(5), m[5]); BSHA_ST(BSHA_H(6), m[6]); BSHA_ST(BSHA_H(7), m[7]);
+  }
+  static inline __attribute__((always_inline)) void resume() { command(0x14); }
+  static inline __attribute__((always_inline)) void start() { command(0x10); }
+  static inline __attribute__((always_inline)) void readHead(uint32_t o[8]) {
+    o[0] = BSHA_LD(BSHA_H(0)); o[1] = BSHA_LD(BSHA_H(1)); o[2] = BSHA_LD(BSHA_H(2)); o[3] = BSHA_LD(BSHA_H(3));
+    o[4] = BSHA_LD(BSHA_H(4)); o[5] = BSHA_LD(BSHA_H(5)); o[6] = BSHA_LD(BSHA_H(6));
+  }
+  static inline __attribute__((always_inline)) void readState(uint32_t o[8]) { o[7] = waitWord7(); readHead(o); }
+  static inline __attribute__((always_inline)) void loadDigest(const uint32_t d[8]) {
+    BSHA_ST(BSHA_T(0), d[0]); BSHA_ST(BSHA_T(1), d[1]); BSHA_ST(BSHA_T(2), d[2]); BSHA_ST(BSHA_T(3), d[3]);
+    BSHA_ST(BSHA_T(4), d[4]); BSHA_ST(BSHA_T(5), d[5]); BSHA_ST(BSHA_T(6), d[6]); BSHA_ST(BSHA_T(7), d[7]);
+  }
+  static inline __attribute__((always_inline)) void loadFinalPadding() {
+    BSHA_ST(BSHA_T(8), 0x80); BSHA_ST(BSHA_T(15), 0x00010000);
+  }
+  static inline __attribute__((always_inline)) uint32_t finalWord() { return waitWord7(); }
+};
+
+// Development only: 1 = midstate word 3 never written (the boot test must reject G32),
+// 2 = stale nonce once per 1,024 (passes the boot test; the diagnostics build must fail).
+#ifndef NERDMINER_BATCHED_SHA_BREAK_G32
+#define NERDMINER_BATCHED_SHA_BREAK_G32 0
+#endif
+using BatchedShaEngineG32 = BatchedShaEngine<true, NERDMINER_BATCHED_SHA_BREAK_G32>;
+using BatchedShaEngineF32 = BatchedShaEngine<false, 0>;
+
+enum BatchedShaKernel : uint8_t { BATCHED_SHA_G32 = 0, BATCHED_SHA_F32 = 1, BATCHED_SHA_ORIGINAL = 2 };
+static const char *const kBatchedShaKernelNames[] = {
+    "G32 (batched x32, SHA_H[7] polling)", "F32 (batched x32, BUSY polling)", "FX1 original loop"};
+static BatchedShaKernel s_batched_sha_kernel = BATCHED_SHA_ORIGINAL;
+
+// Same candidate rule, generation rule and nonce_count as runSha2EngineOriginalRange.
+template <class Engine, class OnFinal>
+static inline __attribute__((always_inline)) uint32_t
+runBatchedRange(const JobRequest *job, JobResult *result, OnFinal &onFinal)
+{
+  uint32_t tail[3];
+  memcpy(tail, job->sha_buffer + 64, sizeof(tail));
+  auto onFilterPass = [job, result](uint32_t nonce, const uint32_t *words) -> bool {
+    uint8_t hash[32];
+    memcpy(hash, words, sizeof(hash));
+    const double diff_hash = diff_from_target(hash);
+    if (diff_hash >= job->difficulty ||
+        mining_validation::hashMeetsTarget(hash, job->network_target)) {
+      result->difficulty = diff_hash;
+      result->nonce = nonce;
+      result->has_candidate = true;
+      memcpy(result->hash, hash, sizeof(hash));
+      memcpy(result->raw_header, job->raw_header, sizeof(result->raw_header));
+      memcpy(result->raw_header + 76, &result->nonce, sizeof(result->nonce));
+      return true;
+    }
+    return false;
+  };
+  auto stale = [job]() {
+    return s_working_generation.load(std::memory_order_acquire) != job->generation;
+  };
+  return batched_sha::hashRange<Engine>(job->midstate, tail, job->nonce_start, job->nonce_count,
+                                   onFilterPass, onFinal, stale);
+}
+
+// Plain functions: GCC drops IRAM_ATTR's section on template instantiations.
+static uint32_t IRAM_ATTR __attribute__((noinline)) runBatchedG32Range(const JobRequest *job, JobResult *result)
+{
+  batched_sha::NoRecord noRecord;
+  return runBatchedRange<BatchedShaEngineG32>(job, result, noRecord);
+}
+static uint32_t IRAM_ATTR __attribute__((noinline)) runBatchedF32Range(const JobRequest *job, JobResult *result)
+{
+  batched_sha::NoRecord noRecord;
+  return runBatchedRange<BatchedShaEngineF32>(job, result, noRecord);
+}
+
+// Caller holds esp_sha_acquire_hardware(). result->nonce_count is preset to job->nonce_count.
+static void runBatchedShaRange(BatchedShaKernel kernel, const JobRequest *job, JobResult *result)
+{
+  if (kernel == BATCHED_SHA_G32)
+    result->nonce_count = runBatchedG32Range(job, result);
+  else if (kernel == BATCHED_SHA_F32)
+    result->nonce_count = runBatchedF32Range(job, result);
+  else
+    runSha2EngineOriginalRange(job, result);
+}
+
+// Production midstate, computed exactly as runStratumWorker does.
+static void batchedHardwareMidstate(JobRequest &job)
+{
+  memset(job.sha_buffer + 80, 0, 48);
+  job.sha_buffer[80] = 0x80; job.sha_buffer[126] = 0x02; job.sha_buffer[127] = 0x80;
+  sha_hal_hash_block(SHA2_256, job.sha_buffer, 64/4, true);
+  sha_hal_read_digest(SHA2_256, job.midstate);
+}
+
+static void scribbleShaText()  // what another SHA user may leave behind between jobs
+{
+  for (int k = 0; k < 16; ++k) REG_WRITE(SHA_TEXT_BASE + 4 * k, 0xA5A50000U ^ (k * 0x01010101U));
+}
+
+// Known-answer test through runBatchedShaRange, over the windows in
+// src/crypto/BatchedShaSelfTest.h (genesis and block 125552). Each window checks that
+// the real nonce is reported as the candidate with the right hash and pos + 1 nonces
+// completed, at batch slot 0, 17, 28 and 31, slot 3 of a second batch, the last slot
+// of a single partial batch and the last slot of a final partial batch after a full
+// one; then that the resumed suffix (FX1's candidate hand-off) completes with no
+// candidate. No window contains a nonce with low byte 0, so the kernel never reads
+// the job generation here and a new stratum job during the test cannot fail it
+// (checked at compile time in that header). Caller holds the SHA hardware.
+static bool batchedKernelKnownAnswers(BatchedShaKernel kernel)
+{
+  using namespace batched_sha_self_test;
+  static JobRequest job;
+  static JobResult result;
+  for (const Window &w : kWindows) {
+    uint8_t want[32];
+    memset(&job, 0, sizeof(job));
+    for (int i = 0; i < 80; ++i) { char pair[3] = {kHeaders[w.block][2*i], kHeaders[w.block][2*i+1], 0}; job.raw_header[i] = strtoul(pair, nullptr, 16); }
+    for (int i = 0; i < 32; ++i) { char pair[3] = {kHashes[w.block][2*i], kHashes[w.block][2*i+1], 0}; want[i] = strtoul(pair, nullptr, 16); }
+    memcpy(job.sha_buffer, job.raw_header, 80);
+    batchedHardwareMidstate(job);
+    uint32_t nonce;
+    memcpy(&nonce, job.raw_header + 76, sizeof(nonce));
+    if (nonce != kNonces[w.block]) return false;
+    job.generation = s_working_generation.load(std::memory_order_acquire);
+    job.difficulty = 1.0;
+    job.nonce_start = nonce - w.pos;
+    job.nonce_count = w.count;
+    memset(&result, 0, sizeof(result));
+    result.nonce_count = job.nonce_count;
+    scribbleShaText();
+    runBatchedShaRange(kernel, &job, &result);
+    if (!result.has_candidate || result.nonce != nonce || result.nonce_count != w.pos + 1 ||
+        memcmp(result.hash, want, 32) != 0)
+      return false;
+    const bool resumed = mining_validation::resumeCompletedPrefix(job, result.nonce_count, job.generation);
+    if (resumed != (w.pos + 1 < w.count)) return false;
+    if (!resumed) continue;  // the candidate was the last nonce of the window
+    memset(&result, 0, sizeof(result));
+    result.nonce_count = job.nonce_count;
+    scribbleShaText();
+    runBatchedShaRange(kernel, &job, &result);
+    if (result.has_candidate || result.nonce_count != w.count - w.pos - 1) return false;
+  }
+  return true;
+}
+
+static void selectBatchedShaKernel()
+{
+  esp_sha_acquire_hardware();
+  const bool g32 = NERDMINER_BATCHED_SHA_FORCE_KERNEL == 0 && batchedKernelKnownAnswers(BATCHED_SHA_G32);
+  const bool f32 = !g32 && NERDMINER_BATCHED_SHA_FORCE_KERNEL <= 1 && batchedKernelKnownAnswers(BATCHED_SHA_F32);
+  esp_sha_release_hardware();
+  s_batched_sha_kernel = g32 ? BATCHED_SHA_G32 : (f32 ? BATCHED_SHA_F32 : BATCHED_SHA_ORIGINAL);
+  Serial.printf("[SHA] %s kernel self-test: G32 %s, F32 %s -> using %s\n", CONFIG_IDF_TARGET,
+                NERDMINER_BATCHED_SHA_FORCE_KERNEL > 0 ? "skipped (forced)" : (g32 ? "pass" : "FAIL"),
+                g32 ? "not needed" : (NERDMINER_BATCHED_SHA_FORCE_KERNEL > 1 ? "skipped (forced)" : (f32 ? "pass" : "FAIL")),
+                kBatchedShaKernelNames[s_batched_sha_kernel]);
+}
+
+#ifdef NERDMINER_SHA_DIAGNOSTICS
+#include "crypto/BatchedShaDiagnostics.h"
+#endif
+#endif  // CONFIG_IDF_TARGET_ESP32S3 || CONFIG_IDF_TARGET_ESP32C3
+
+void minerWorkerHw(void * task_id)
+{
+  unsigned int miner_id = (uint32_t)task_id;
+  Serial.printf("[MINER] %d Started minerWorkerHw Task!\n", miner_id);
+
+  std::shared_ptr<JobRequest> job;
+  std::shared_ptr<JobResult> result;
+  uint32_t wdt_counter = 0;
+#ifdef NERDMINER_BATCHED_SHA
+  selectBatchedShaKernel();
+#endif
+
+  while (1)
+  {
+    finishWorkerRange(s_job_request_list_hw, job, result);
+    {
+      std::lock_guard<std::mutex> lock(s_job_mutex);
+      if (!s_job_request_list_hw.empty())
+      {
+        job = s_job_request_list_hw.front();
+        s_job_request_list_hw.pop_front();
+      } else
+        job.reset();
+    }
+    if (job)
+    {
+      result = std::make_shared<JobResult>();
+      result->generation = job->generation;
+      result->nonce = 0xFFFFFFFF;
+      result->nonce_count = job->nonce_count;
+      result->difficulty = job->difficulty;
+      result->required_difficulty = job->difficulty;
+
+      esp_sha_acquire_hardware();
+#ifdef NERDMINER_BATCHED_SHA
+      runBatchedShaRange(s_batched_sha_kernel, job.get(), result.get());
+#else
+      runSha2EngineOriginalRange(job.get(), result.get());
+#endif
       esp_sha_release_hardware();
     } else
       vTaskDelay(2 / portTICK_PERIOD_MS);

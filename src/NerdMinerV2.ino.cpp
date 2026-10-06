@@ -66,11 +66,25 @@ void setup()
       digitalWrite(PIN_ENABLE5V, HIGH);
   #endif
 
+#if ARDUINO_USB_CDC_ON_BOOT && ARDUINO_USB_MODE
+  // Room for a whole stratum line: with the zero TX timeout below, a print larger than the
+  // free buffer space is cut short (core default 256 bytes). Must be set before begin().
+  Serial.setTxBufferSize(2048);
+#endif
 #ifdef MONITOR_SPEED
     Serial.begin(MONITOR_SPEED);
 #else
     Serial.begin(115200);
 #endif //MONITOR_SPEED
+#if ARDUINO_USB_CDC_ON_BOOT
+  // USB-serial console (S3, C3, ...): once a computer enumerates the port, the core waits up
+  // to 100 ms per console write for buffer space. If nothing on the computer reads the port,
+  // every log line stalls the task that prints it and the hashrate drops to ~75 kH/s.
+  // Drop console output instead of waiting. Side effects even with a reader attached: a
+  // print that does not fit the free TX buffer is truncated, and a print racing another
+  // task's print is dropped. Console logs only; mining is unaffected.
+  Serial.setTxTimeoutMs(0);
+#endif
 
   Serial.setTimeout(0);
   delay(SECOND_MS/10);
@@ -79,7 +93,11 @@ void setup()
   // Idle task that would reset WDT never runs, because core 0 gets fully utilized
   disableCore0WDT();
 #ifdef NERDMINER_SHA_DIAGNOSTICS
+#if defined(CONFIG_IDF_TARGET_ESP32S3) || defined(CONFIG_IDF_TARGET_ESP32C3)
+  runBatchedShaDiagnostics();
+#else
   runClassicShaDiagnostics();
+#endif
   for (;;) delay(1000);
 #endif
   //disableCore1WDT();
@@ -91,22 +109,22 @@ void setup()
   // Setup the buttons
   #if defined(PIN_BUTTON_1) && !defined(PIN_BUTTON_2) //One button device
     button1.setPressMs(5*SECOND_MS);
-    button1.attachClick(switchToNextScreen);
-    button1.attachDoubleClick(alternateScreenRotation);
-    button1.attachLongPressStart(reset_configuration);
-    button1.attachMultiClick(alternateScreenState);
+    button1.attachClick(SCREEN_WAKE_OR(switchToNextScreen));
+    button1.attachDoubleClick(SCREEN_WAKE_OR(alternateScreenRotation));
+    button1.attachLongPressStart(SCREEN_WAKE_OR(reset_configuration));
+    button1.attachMultiClick(SCREEN_WAKE_OR(alternateScreenState));
   #endif
 
   #if defined(PIN_BUTTON_1) && defined(PIN_BUTTON_2) //Button 1 of two button device
     button1.setPressMs(5*SECOND_MS);
-    button1.attachClick(alternateScreenState);
-    button1.attachDoubleClick(alternateScreenRotation);
+    button1.attachClick(SCREEN_WAKE_OR(alternateScreenState));
+    button1.attachDoubleClick(SCREEN_WAKE_OR(alternateScreenRotation));
   #endif
 
   #if defined(PIN_BUTTON_2) //Button 2 of two button device
     button2.setPressMs(5*SECOND_MS);
-    button2.attachClick(switchToNextScreen);
-    button2.attachLongPressStart(reset_configuration);
+    button2.attachClick(SCREEN_WAKE_OR(switchToNextScreen));
+    button2.attachLongPressStart(SCREEN_WAKE_OR(reset_configuration));
   #endif
 
   /******** INIT NERDMINER ************/
@@ -167,6 +185,8 @@ void setup()
     #if defined(CONFIG_IDF_TARGET_ESP32)
     xTaskCreatePinnedToCore(minerWorkerHw, "MinerHw-0", 3584, (void*)0, 3, &minerTask1, 0); // Leave core 1 available to network/TLS tasks.
     //xTaskCreate(minerWorkerSw, "MinerSw-0", 5000, (void*)0, 1, &minerTask1); // Reduced for ESP32 classic
+    #elif defined(CONFIG_IDF_TARGET_ESP32S3) || defined(CONFIG_IDF_TARGET_ESP32C3)
+    xTaskCreate(minerWorkerHw, "MinerHw-0", 6144, (void*)0, 3, &minerTask1); // batched SHA keeps 1 KB of digests on the stack
     #else
     xTaskCreate(minerWorkerHw, "MinerHw-0", 4096, (void*)0, 3, &minerTask1);
     #endif
@@ -214,6 +234,10 @@ void loop() {
   #ifdef PIN_BUTTON_2
     button2.tick();
   #endif
+
+#ifdef BUTTON_SCREEN_SLEEP_SECONDS
+  screenSleepTick();
+#endif
 
 #ifdef TOUCH_ENABLE
   touchHandler.isTouched();

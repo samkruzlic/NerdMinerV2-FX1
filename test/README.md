@@ -13,3 +13,11 @@ implementation, exact target comparison, candidate validation, generation and
 range behavior, and fixed-seed differential comparison with the optimized
 software mining SHA. Its block-header vectors cover genesis and heights 1,
 100000, and 700000.
+
+`native_screen_sleep.cpp` covers the button screen sleep built with
+`BUTTON_SCREEN_SLEEP_SECONDS` (the `*_SCREEN_SLEEP` environments): the timer
+starts with the first mining frame, nothing is drawn or animated while dark,
+every button event while dark only wakes the screen, and the timer survives the
+`millis()` wrap. Run `tools/run_screen_sleep_tests.sh`; it also checks that
+deliberately broken copies fail. Button timing, the real backlight pin and the
+hashrate gain need the board.

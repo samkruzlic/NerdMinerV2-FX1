@@ -24,7 +24,11 @@ void runMiner(void *name);
 void minerWorkerSw(void * task_id);
 void minerWorkerHw(void * task_id);
 #ifdef NERDMINER_SHA_DIAGNOSTICS
+#if defined(CONFIG_IDF_TARGET_ESP32S3) || defined(CONFIG_IDF_TARGET_ESP32C3)
+void runBatchedShaDiagnostics();
+#else
 void runClassicShaDiagnostics();
+#endif
 #endif
 
 String printLocalTime(void);

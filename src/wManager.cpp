@@ -135,7 +135,9 @@ void init_WifiManager()
 #else
     Serial.begin(115200);
 #endif //MONITOR_SPEED
-    //Serial.setTxTimeoutMs(10);
+#if ARDUINO_USB_CDC_ON_BOOT
+    Serial.setTxTimeoutMs(0);  // see setup(): never block on an unread USB console
+#endif
     
     // Check for custom AP name from flasher config, otherwise use default
     String customAPName = readCustomAPName();
